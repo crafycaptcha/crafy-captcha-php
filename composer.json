@@ -1,0 +1,23 @@
+{
+  "name": "crafycaptcha/crafy-captcha",
+  "description": "Official CrafyCAPTCHA SDK for PHP",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "CrafyCAPTCHA",
+      "email": "hello@captcha.crafy.net"
+    }
+  ],
+  "require": {
+    "php": ">=7.4",
+    "ext-curl": "*",
+    "ext-json": "*",
+    "ext-sodium": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "Crafy\\Captcha\\": "src/"
+    }
+  }
+}
