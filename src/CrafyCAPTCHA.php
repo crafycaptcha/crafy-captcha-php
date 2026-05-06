@@ -35,7 +35,7 @@ class CrafyCAPTCHA
      * @param string $secretKey La llave secreta (sk_...)
      * @param string $baseUrl URL de la API (por defecto producción)
      */
-    public function __construct(string $publicKey, string $secretKey, string $baseUrl = 'https://captcha.crafy.net')
+    public function __construct(string $publicKey, string $secretKey, string $baseUrl = 'https://captcha.crafy.net/api')
     {
         $this->publicKey = $publicKey;
         $this->secretKey = $secretKey;
