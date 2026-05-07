@@ -28,6 +28,7 @@ class CrafyCAPTCHA
     // Estado interno
     private ?string $accessToken = null;
     private ?string $lastFlowVerifyError = null;
+    private ?string $publicToken = null;
 
     /**
      * Constructor
@@ -51,7 +52,7 @@ class CrafyCAPTCHA
     {
         $hash = md5($this->publicKey . $this->secretKey);
         $this->cacheFile = rtrim($path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'crafy_token_' . $hash . '.json';
-        
+
         $this->nonceDir = rtrim($path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'crafy_nonces';
         if (!is_dir($this->nonceDir)) {
             @mkdir($this->nonceDir, 0777, true);
@@ -84,6 +85,16 @@ class CrafyCAPTCHA
     {
         $this->retryStatusCodes = $codes;
         return $this;
+    }
+
+    /**
+     * Obtiene el Public Token dinámicamente.
+     * Si no está en memoria o caché, dispara la autenticación.
+     */
+    public function getPublicToken(): string
+    {
+        $this->ensureAuth();
+        return $this->publicToken;
     }
 
     /**
@@ -237,8 +248,9 @@ class CrafyCAPTCHA
         if ($files === null) {
             $files = glob($this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_*.lock');
         }
-        if ($files === false) return;
-        
+        if ($files === false)
+            return;
+
         $now = time();
         foreach ($files as $file) {
             if (is_file($file) && ($now - filemtime($file) > 1200)) { // 20 min TTL
@@ -255,8 +267,9 @@ class CrafyCAPTCHA
     public function clearAllNonces(): int
     {
         $files = glob($this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_*.lock');
-        if ($files === false) return 0;
-        
+        if ($files === false)
+            return 0;
+
         $count = 0;
         foreach ($files as $file) {
             if (is_file($file) && @unlink($file)) {
@@ -287,33 +300,53 @@ class CrafyCAPTCHA
 
     private function ensureAuth(bool $forceRefresh = false): void
     {
-        if (!$forceRefresh && $this->accessToken)
+        if (!$forceRefresh && $this->accessToken && $this->publicToken)
             return;
 
         if (!$forceRefresh && file_exists($this->cacheFile)) {
-            $cached = json_decode(@file_get_contents($this->cacheFile), true);
-            if (isset($cached['token'], $cached['expires_at']) && time() < ($cached['expires_at'] - 60)) {
-                $this->accessToken = $cached['token'];
-                return;
+            $rawContent = @file_get_contents($this->cacheFile);
+
+            if ($rawContent) {
+                // Intentamos desencriptar la caché con la secretKey
+                $decrypted = $this->getCryptor()->decrypt($rawContent);
+                $cached = $decrypted ? json_decode($decrypted, true) : null;
+
+                if (isset($cached['token'], $cached['public_token'], $cached['expires_at'])) {
+                    if (time() < ($cached['expires_at'] - 60)) {
+                        $this->accessToken = $cached['token'];
+                        $this->publicToken = $cached['public_token'];
+                        return;
+                    }
+                }
             }
         }
 
         $authPayload = ['public_key' => $this->publicKey, 'secret_key' => $this->secretKey];
         $response = $this->sendRequest('authenticate', $authPayload, false);
 
-        if (empty($response['token'])) {
-            throw new Exception("CrafyCAPTCHA SDK: No se recibió token de autenticación.");
+        if (empty($response['token']) || empty($response['public_token'])) {
+            throw new Exception("CrafyCAPTCHA SDK: Error en la respuesta de autenticación.");
         }
 
         $this->accessToken = $response['token'];
-        $expiresIn = (int) ($response['expires_in'] ?? 3600);
-        $this->saveCache($this->accessToken, time() + $expiresIn);
+        $this->publicToken = $response['public_token'];
+
+        $expiresIn = (int) ($response['expires_in'] ?? 86400); // 24hs por defecto
+        $this->saveCache($this->accessToken, $this->publicToken, time() + $expiresIn);
     }
 
-    private function saveCache(string $token, int $expiresAt): void
+    private function saveCache(string $token, string $publicToken, int $expiresAt): void
     {
-        $data = json_encode(['token' => $token, 'expires_at' => $expiresAt]);
-        if (@file_put_contents($this->cacheFile, $data, LOCK_EX) !== false) {
+        $data = json_encode([
+            'token' => $token,
+            'public_token' => $publicToken,
+            'expires_at' => $expiresAt
+        ]);
+
+        // Encriptamos los datos sensibles antes de escribirlos en el directorio temporal
+        $encryptedData = $this->getCryptor()->encrypt($data);
+
+        if (@file_put_contents($this->cacheFile, $encryptedData, LOCK_EX) !== false) {
             @chmod($this->cacheFile, 0600);
         }
     }
@@ -321,6 +354,7 @@ class CrafyCAPTCHA
     private function clearCache(): void
     {
         $this->accessToken = null;
+        $this->publicToken = null;
         if (file_exists($this->cacheFile)) {
             @unlink($this->cacheFile);
         }
@@ -329,7 +363,7 @@ class CrafyCAPTCHA
     private function sendRequest(string $action, array $data, bool $useAuth): array
     {
         $url = $this->baseUrl . '/?action=' . urlencode($action);
-        
+
         $headers = [
             'Content-Type: application/json',
             'Accept: application/json',
@@ -350,7 +384,7 @@ class CrafyCAPTCHA
             }
 
             $responseHeaders = [];
-            
+
             curl_setopt_array($ch, [
                 CURLOPT_POST => true,
                 CURLOPT_POSTFIELDS => json_encode($data),
@@ -358,7 +392,7 @@ class CrafyCAPTCHA
                 CURLOPT_HTTPHEADER => $headers,
                 CURLOPT_TIMEOUT => $this->timeout,
                 CURLOPT_SSL_VERIFYPEER => true,
-                CURLOPT_HEADERFUNCTION => function($curl, $header) use (&$responseHeaders) {
+                CURLOPT_HEADERFUNCTION => function ($curl, $header) use (&$responseHeaders) {
                     $len = strlen($header);
                     $parts = explode(':', $header, 2);
                     if (count($parts) >= 2) {
@@ -387,7 +421,7 @@ class CrafyCAPTCHA
                 if (isset($responseHeaders['retry-after'])) {
                     $retryAfter = $responseHeaders['retry-after'];
                     if (is_numeric($retryAfter)) {
-                        $delayUs = (int)$retryAfter * 1000000;
+                        $delayUs = (int) $retryAfter * 1000000;
                     } else {
                         $time = strtotime($retryAfter);
                         if ($time !== false && $time > time()) {
@@ -414,7 +448,7 @@ class CrafyCAPTCHA
                 throw new Exception("Unauthorized", 401); // Para que el método call() lo capture
             }
 
-            $response = json_decode((string)$resultRaw, true);
+            $response = json_decode((string) $resultRaw, true);
 
             // Evitar crash si es un error HTML (ej. Cloudflare 500)
             if (json_last_error() !== JSON_ERROR_NONE) {
@@ -465,11 +499,11 @@ class CrafyCAPTCHA
                 if ($secret === '')
                     throw new \InvalidArgumentException('Secret no puede ser vacío.');
                 $this->secret = $secret;
-                
+
                 if (function_exists('sodium_crypto_generichash')) {
                     $this->v3Key = sodium_crypto_generichash($secret, '', self::KEY_LEN);
                 }
-                
+
                 $this->v1Key = hash(self::HASHING_ALGORITHM, $secret, true);
             }
 
@@ -480,13 +514,13 @@ class CrafyCAPTCHA
 
                     $ciphertext = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt(
                         $plaintext,
-                        '', 
+                        '',
                         $nonce,
                         $this->v3Key
                     );
 
                     return ';v3_;' . base64_encode($nonce . $ciphertext);
-                    
+
                 } elseif ($version == 2 && function_exists('sodium_crypto_pwhash')) {
                     $salt = random_bytes(self::SALT_LEN);
 
@@ -535,7 +569,7 @@ class CrafyCAPTCHA
                 if ($first_chars === ';v3_;' && function_exists('sodium_crypto_generichash')) {
                     $input = substr($input, 5);
                     $decoded = base64_decode($input, true);
-                    
+
                     if ($decoded === false || strlen($decoded) < self::NONCE_LEN) {
                         return null;
                     }
@@ -594,7 +628,7 @@ class CrafyCAPTCHA
                     $iv = substr($binaryInput, 0, 16);
                     $hash = substr($binaryInput, 16, 32);
                     $cipherText = substr($binaryInput, 48);
-                    
+
                     $calculatedHash = hash_hmac(self::HASHING_ALGORITHM, $cipherText, $this->v1Key, true);
 
                     if (!hash_equals($hash, $calculatedHash)) {
@@ -608,11 +642,11 @@ class CrafyCAPTCHA
                         OPENSSL_RAW_DATA,
                         $iv
                     );
-                    
+
                     return $plaintext === false ? null : $plaintext;
                 }
             }
-            
+
             public function __destruct()
             {
                 if (function_exists('sodium_memzero') && isset($this->v3Key)) {
