@@ -5,10 +5,265 @@ namespace Crafy\Captcha;
 use Exception;
 use DateTime;
 use DateTimeZone;
+use PDO;
+use PDOException;
 
+/**
+ * Interfaz unificada para el almacenamiento de Caché y Nonces.
+ */
+interface StorageInterface
+{
+    /**
+     * Obtiene un valor de caché por su clave.
+     * @param string $key Clave identificadora del recurso en caché.
+     * @return string|null Contenido almacenado o null si no existe.
+     */
+    public function getCache(string $key): ?string;
+
+    /**
+     * Almacena un valor en caché con tiempo de expiración.
+     * @param string $key Clave identificadora.
+     * @param string $data Datos a almacenar (ya encriptados).
+     * @param int $expiresAt Timestamp UNIX de expiración.
+     */
+    public function setCache(string $key, string $data, int $expiresAt): void;
+
+    /**
+     * Elimina un valor de caché por su clave.
+     * @param string $key Clave identificadora del recurso a eliminar.
+     */
+    public function deleteCache(string $key): void;
+
+    /**
+     * Almacena un nonce temporal para validación Anti-Replay.
+     * @param string $nonce Nonce criptográfico (hex).
+     * @param int $expiresAt Timestamp UNIX de expiración.
+     */
+    public function storeNonce(string $nonce, int $expiresAt): void;
+
+    /**
+     * Consume (valida y elimina) un nonce de forma atómica.
+     * Solo el primer consumo retorna true; llamadas posteriores retornan false.
+     * @param string $nonce Nonce a consumir.
+     * @return bool True si el nonce existía y fue consumido exitosamente.
+     */
+    public function consumeNonce(string $nonce): bool;
+
+    /**
+     * Elimina TODOS los nonces almacenados de forma inmediata.
+     * Útil para mantenimiento o limpieza manual.
+     * @return int Número de nonces eliminados.
+     */
+    public function clearAllNonces(): int;
+
+    /**
+     * Ejecuta Garbage Collection para limpiar nonces expirados.
+     * La implementación puede usar lógica probabilística para reducir overhead.
+     */
+    public function gcNonces(): void;
+}
+
+/**
+ * Almacenamiento por defecto utilizando archivos temporales del sistema.
+ */
+class FileStorage implements StorageInterface
+{
+    private string $cacheDir;
+    private string $nonceDir;
+
+    /**
+     * Constructor del almacenamiento basado en archivos.
+     * @param string $tempDir Directorio base para archivos de caché y nonces.
+     */
+    public function __construct(string $tempDir)
+    {
+        $this->cacheDir = $tempDir;
+        $this->nonceDir = rtrim($tempDir, '/\\') . DIRECTORY_SEPARATOR . 'crafy_nonces';
+        if (!is_dir($this->nonceDir)) {
+            @mkdir($this->nonceDir, 0777, true);
+        }
+    }
+
+    /** {@inheritdoc} */
+    public function getCache(string $key): ?string
+    {
+        $file = $this->cacheDir . DIRECTORY_SEPARATOR . $key . '.json';
+        if (file_exists($file)) {
+            return @file_get_contents($file) ?: null;
+        }
+        return null;
+    }
+
+    /** {@inheritdoc} */
+    public function setCache(string $key, string $data, int $expiresAt): void
+    {
+        $file = $this->cacheDir . DIRECTORY_SEPARATOR . $key . '.json';
+        if (@file_put_contents($file, $data, LOCK_EX) !== false) {
+            @chmod($file, 0600);
+        }
+    }
+
+    /** {@inheritdoc} */
+    public function deleteCache(string $key): void
+    {
+        $file = $this->cacheDir . DIRECTORY_SEPARATOR . $key . '.json';
+        if (file_exists($file)) {
+            @unlink($file);
+        }
+    }
+
+    /** {@inheritdoc} */
+    public function storeNonce(string $nonce, int $expiresAt): void
+    {
+        $file = $this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_' . $nonce . '.lock';
+        @file_put_contents($file, (string) $expiresAt, LOCK_EX);
+    }
+
+    /** {@inheritdoc} Utiliza unlink() atómico: solo un proceso puede borrar el archivo. */
+    public function consumeNonce(string $nonce): bool
+    {
+        $file = $this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_' . $nonce . '.lock';
+        if (file_exists($file)) {
+            // unlink() es atómico y devolverá true solo si este proceso logró borrarlo
+            return @unlink($file);
+        }
+        return false;
+    }
+
+    /** {@inheritdoc} */
+    public function clearAllNonces(): int
+    {
+        $files = glob($this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_*.lock');
+        $count = 0;
+        if (is_array($files)) {
+            foreach ($files as $file) {
+                if (@unlink($file))
+                    $count++;
+            }
+        }
+        return $count;
+    }
+
+    /** {@inheritdoc} Limpia si hay >50 archivos o con probabilidad 1/100. TTL: 20 min. */
+    public function gcNonces(): void
+    {
+        $files = glob($this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_*.lock');
+        if (is_array($files)) {
+            // Limpieza si hay muchos archivos o con probabilidad aleatoria baja
+            if (count($files) > 50 || random_int(1, 100) === 1) {
+                $now = time();
+                foreach ($files as $file) {
+                    if (is_file($file) && filemtime($file) < ($now - 1200)) { // 20 min TTL
+                        @unlink($file);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Almacenamiento opcional en base de datos SQL (MySQL/MariaDB, PostgreSQL, SQLite).
+ */
+class PDOStorage implements StorageInterface
+{
+    private PDO $pdo;
+    private string $tableName;
+
+    /**
+     * Constructor del almacenamiento basado en base de datos.
+     * Crea la tabla automáticamente si no existe.
+     * @param PDO $pdo Instancia de PDO conectada (MySQL/MariaDB, PostgreSQL, SQLite).
+     * @param string $tableName Nombre de la tabla de almacenamiento.
+     */
+    public function __construct(PDO $pdo, string $tableName = 'crafy_storage')
+    {
+        $this->pdo = $pdo;
+        $this->tableName = $tableName;
+        $this->initTable();
+    }
+
+    /**
+     * Crea la tabla de almacenamiento si no existe.
+     */
+    private function initTable(): void
+    {
+        $sql = "CREATE TABLE IF NOT EXISTS {$this->tableName} (
+            id VARCHAR(128) PRIMARY KEY,
+            type VARCHAR(16) NOT NULL,
+            data TEXT NULL,
+            expires_at INT NOT NULL
+        )";
+        $this->pdo->exec($sql);
+    }
+
+    /** {@inheritdoc} */
+    public function getCache(string $key): ?string
+    {
+        $stmt = $this->pdo->prepare("SELECT data FROM {$this->tableName} WHERE id = ? AND type = 'cache' AND expires_at > ?");
+        $stmt->execute([$key, time()]);
+        $result = $stmt->fetchColumn();
+        return $result !== false ? (string) $result : null;
+    }
+
+    /** {@inheritdoc} */
+    public function setCache(string $key, string $data, int $expiresAt): void
+    {
+        $this->deleteCache($key);
+        $stmt = $this->pdo->prepare("INSERT INTO {$this->tableName} (id, type, data, expires_at) VALUES (?, 'cache', ?, ?)");
+        $stmt->execute([$key, $data, $expiresAt]);
+    }
+
+    /** {@inheritdoc} */
+    public function deleteCache(string $key): void
+    {
+        $stmt = $this->pdo->prepare("DELETE FROM {$this->tableName} WHERE id = ? AND type = 'cache'");
+        $stmt->execute([$key]);
+    }
+
+    /** {@inheritdoc} Ignora duplicados silenciosamente. */
+    public function storeNonce(string $nonce, int $expiresAt): void
+    {
+        $stmt = $this->pdo->prepare("INSERT INTO {$this->tableName} (id, type, data, expires_at) VALUES (?, 'nonce', '', ?)");
+        try {
+            $stmt->execute([$nonce, $expiresAt]);
+        } catch (PDOException $e) {
+            // Ignorar duplicados
+        }
+    }
+
+    /** {@inheritdoc} Usa DELETE atómico: solo un request concurrente puede afectar la fila. */
+    public function consumeNonce(string $nonce): bool
+    {
+        // El DELETE atómico asegura que si hay requests concurrentes, solo uno afectará la fila y devolverá true
+        $stmt = $this->pdo->prepare("DELETE FROM {$this->tableName} WHERE id = ? AND type = 'nonce' AND expires_at > ?");
+        $stmt->execute([$nonce, time()]);
+        return $stmt->rowCount() > 0;
+    }
+
+    /** {@inheritdoc} */
+    public function clearAllNonces(): int
+    {
+        $stmt = $this->pdo->prepare("DELETE FROM {$this->tableName} WHERE type = 'nonce'");
+        $stmt->execute();
+        return $stmt->rowCount();
+    }
+
+    /** {@inheritdoc} Ejecuta con probabilidad 1/100. Limpia cache y nonces expirados. */
+    public function gcNonces(): void
+    {
+        if (random_int(1, 100) === 1) {
+            $stmt = $this->pdo->prepare("DELETE FROM {$this->tableName} WHERE expires_at <= ?");
+            $stmt->execute([time()]);
+        }
+    }
+}
+
+/**
+ * Cliente Principal SDK CrafyCAPTCHA
+ */
 class CrafyCAPTCHA
 {
-
     private string $publicKey;
     private string $secretKey;
     private string $baseUrl;
@@ -21,9 +276,8 @@ class CrafyCAPTCHA
     private int $baseDelayMs = 500;
     private array $retryStatusCodes = [429, 500, 502, 503, 504];
 
-    // Rutas de caché y nonces
-    private string $cacheFile;
-    private string $nonceDir;
+    // Motor de Almacenamiento
+    private StorageInterface $storage;
 
     // Estado interno
     private ?string $accessToken = null;
@@ -42,26 +296,32 @@ class CrafyCAPTCHA
         $this->secretKey = $secretKey;
         $this->baseUrl = rtrim($baseUrl, '/');
 
-        $this->setTempDir(sys_get_temp_dir());
+        // Por defecto, inicializamos el almacenamiento basado en archivos
+        $this->storage = new FileStorage(sys_get_temp_dir());
     }
 
     /**
-     * Establece el directorio temporal para guardar archivos de caché y nonces.
+     * Inyecta un sistema de almacenamiento personalizado (PDO, Redis, Memcached, etc.)
+     */
+    public function setStorage(StorageInterface $storage): self
+    {
+        $this->storage = $storage;
+        return $this;
+    }
+
+    /**
+     * @deprecated Usa setStorage(new FileStorage($path))
      */
     public function setTempDir(string $path): self
     {
-        $hash = md5($this->publicKey . $this->secretKey);
-        $this->cacheFile = rtrim($path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'crafy_token_' . $hash . '.json';
-
-        $this->nonceDir = rtrim($path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'crafy_nonces';
-        if (!is_dir($this->nonceDir)) {
-            @mkdir($this->nonceDir, 0777, true);
-        }
+        $this->storage = new FileStorage($path);
         return $this;
     }
 
     /**
      * Establece el número máximo de reintentos para peticiones HTTP fallidas.
+     * @param int $retries Número de reintentos (mínimo 0).
+     * @return self
      */
     public function setMaxRetries(int $retries): self
     {
@@ -71,6 +331,8 @@ class CrafyCAPTCHA
 
     /**
      * Establece el tiempo base de espera (en milisegundos) para el Backoff Exponencial.
+     * @param int $milliseconds Tiempo base en ms (mínimo 0).
+     * @return self
      */
     public function setBaseDelayMs(int $milliseconds): self
     {
@@ -80,6 +342,8 @@ class CrafyCAPTCHA
 
     /**
      * Establece los códigos HTTP que detonarán un reintento (Backoff).
+     * @param array $codes Lista de códigos HTTP (ej: [429, 500, 502, 503, 504]).
+     * @return self
      */
     public function setRetryStatusCodes(array $codes): self
     {
@@ -88,8 +352,18 @@ class CrafyCAPTCHA
     }
 
     /**
+     * Genera la clave única de caché basada en las credenciales.
+     * @return string Clave de caché derivada de public+secret key.
+     */
+    private function getCacheKey(): string
+    {
+        return 'crafy_token_' . md5($this->publicKey . $this->secretKey);
+    }
+
+    /**
      * Obtiene el Public Token dinámicamente.
      * Si no está en memoria o caché, dispara la autenticación.
+     * @return string Public Token para uso en el frontend.
      */
     public function getPublicToken(): string
     {
@@ -105,21 +379,15 @@ class CrafyCAPTCHA
      */
     public function createFlow(array $options = []): string
     {
-        // 1. Generar Nonce criptográficamente seguro
         $nonce = bin2hex(random_bytes(32));
 
-        // 2. Guardar el Nonce en archivo temporal (Lock file)
-        $nonceFile = $this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_' . $nonce . '.lock';
+        // Almacenar el nonce temporal con un TTL de 20 minutos (1200 seg)
+        $this->storage->storeNonce($nonce, time() + 1200);
 
-        if (@file_put_contents($nonceFile, (string) time()) === false) {
-            throw new Exception("CrafyCAPTCHA: No se pudo escribir el archivo nonce temporal.");
-        }
-
-        // 3. Preparar las opciones e inyectar el nonce
-        $flowData = array_merge($options, ['nonce' => $nonce]);
+        $flowData = $options;
+        $flowData['nonce'] = $nonce;
         $jsonOptions = json_encode($flowData);
 
-        // 4. Encriptar usando la clase anónima
         return $this->getCryptor()->encrypt($jsonOptions);
     }
 
@@ -131,20 +399,17 @@ class CrafyCAPTCHA
      */
     public function verifyFlow(string $base64Payload): bool
     {
+        $this->lastFlowVerifyError = null;
+
         if (empty($base64Payload)) {
             $this->lastFlowVerifyError = 'El token está vacío.';
             return false;
         }
 
-        // 1. Decodificar el sobre
         $jsonEnvelope = base64_decode($base64Payload);
-        if (!$jsonEnvelope) {
-            $this->lastFlowVerifyError = 'No se pudo decodificar el token.';
-            return false;
-        }
-
         $envelope = json_decode($jsonEnvelope, true);
-        if (!isset($envelope['payload'], $envelope['server_sign'])) {
+
+        if (!$envelope || empty($envelope['payload']) || empty($envelope['server_sign'])) {
             $this->lastFlowVerifyError = 'Token malformado.';
             return false;
         }
@@ -152,7 +417,6 @@ class CrafyCAPTCHA
         $payloadJson = $envelope['payload'];
         $signature = $envelope['server_sign'];
 
-        // 2. Validar Firma (HMAC SHA256)
         $expectedSignature = hash_hmac('sha256', $payloadJson, $this->secretKey);
 
         if (!hash_equals($expectedSignature, $signature)) {
@@ -160,27 +424,29 @@ class CrafyCAPTCHA
             return false;
         }
 
-        // 3. Decodificar Payload Interno
         $data = json_decode($payloadJson, true);
         if (!$data) {
             $this->lastFlowVerifyError = 'No se pudo decodificar el payload interno.';
             return false;
         }
 
-        // 4. Validar Estado
-        if (!isset($data['status']) || $data['status'] !== 'success') {
+        if (($data['status'] ?? '') !== 'success') {
             $this->lastFlowVerifyError = 'Estado de Flow inválido.';
             return false;
         }
 
-        // 5. Validar Expiración (UTC)
-        if (!isset($data['expires_at'])) {
+        if (empty($data['expires_at'])) {
             $this->lastFlowVerifyError = 'Fecha de expiración no definida.';
             return false;
         }
 
         try {
-            $expiresAt = new DateTime($data['expires_at'], new DateTimeZone('UTC'));
+            $cleanDate = str_replace('Z', '+00:00', $data['expires_at']);
+            $expiresAt = new DateTime($cleanDate);
+            if (!$expiresAt->getTimezone() || $expiresAt->getTimezone()->getName() === 'Z') {
+                $expiresAt->setTimezone(new DateTimeZone('UTC'));
+            }
+
             $now = new DateTime('now', new DateTimeZone('UTC'));
 
             if ($now > $expiresAt) {
@@ -192,15 +458,14 @@ class CrafyCAPTCHA
             return false;
         }
 
-        // 6. Validar Nonce (Protección Anti-Replay)
-        if (!isset($data['nonce'])) {
+        if (empty($data['nonce'])) {
             $this->lastFlowVerifyError = 'Nonce no encontrado.';
             return false;
         }
 
         $decryptedNonce = $this->getCryptor()->decrypt($data['nonce']);
 
-        if (!isset($decryptedNonce) || !$decryptedNonce) {
+        if (!$decryptedNonce) {
             $this->lastFlowVerifyError = 'No se pudo decodificar el nonce.';
             return false;
         }
@@ -211,21 +476,14 @@ class CrafyCAPTCHA
             return false;
         }
 
-        $nonceFile = $this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_' . $cleanNonce . '.lock';
-
-        // Intento de borrado atómico
-        if (!@unlink($nonceFile)) {
-            $this->lastFlowVerifyError = 'Nonce ya utilizado (Replay Attack).';
+        // Intento atómico de validación y borrado (Anti-Replay)
+        if (!$this->storage->consumeNonce($cleanNonce)) {
+            $this->lastFlowVerifyError = 'Nonce ya utilizado (Replay Attack) o expirado.';
             return false;
         }
 
-        // 7. Garbage Collection: siempre si >50 archivos, o 1/100 aleatorio
-        $nonceFiles = glob($this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_*.lock');
-        if ($nonceFiles !== false && count($nonceFiles) > 50) {
-            $this->garbageCollectNonces($nonceFiles);
-        } elseif (rand(1, 100) === 1) {
-            $this->garbageCollectNonces();
-        }
+        // Garbage Collection
+        $this->storage->gcNonces();
 
         return true;
     }
@@ -240,47 +498,22 @@ class CrafyCAPTCHA
     }
 
     /**
-     * Limpia nonces viejos que nunca fueron usados.
-     * @param array|null $files Lista de archivos pre-cargada (para evitar doble glob).
-     */
-    private function garbageCollectNonces(?array $files = null): void
-    {
-        if ($files === null) {
-            $files = glob($this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_*.lock');
-        }
-        if ($files === false)
-            return;
-
-        $now = time();
-        foreach ($files as $file) {
-            if (is_file($file) && ($now - filemtime($file) > 1200)) { // 20 min TTL
-                @unlink($file);
-            }
-        }
-    }
-
-    /**
-     * Elimina TODOS los archivos nonce de forma inmediata.
+     * Elimina TODOS los nonces almacenados de forma inmediata.
      * Útil para mantenimiento o limpieza manual.
-     * @return int Número de archivos eliminados.
+     * @return int Número de nonces eliminados.
      */
     public function clearAllNonces(): int
     {
-        $files = glob($this->nonceDir . DIRECTORY_SEPARATOR . 'nonce_*.lock');
-        if ($files === false)
-            return 0;
-
-        $count = 0;
-        foreach ($files as $file) {
-            if (is_file($file) && @unlink($file)) {
-                $count++;
-            }
-        }
-        return $count;
+        return $this->storage->clearAllNonces();
     }
 
     /**
      * Realiza una llamada a la API gestionando la autenticación automáticamente.
+     * Si recibe un 401, refresca las credenciales y reintenta.
+     * @param string $action Nombre de la acción de la API.
+     * @param array $data Datos a enviar en el body de la petición.
+     * @return array Datos de respuesta de la API.
+     * @throws Exception En caso de error de red, autenticación o API.
      */
     public function call(string $action, array $data = []): array
     {
@@ -298,16 +531,20 @@ class CrafyCAPTCHA
         }
     }
 
+    /**
+     * Asegura que el SDK esté autenticado.
+     * Busca primero en memoria, luego en caché encriptada, y si no, autentica contra la API.
+     * @param bool $forceRefresh Si es true, ignora caché y fuerza re-autenticación.
+     */
     private function ensureAuth(bool $forceRefresh = false): void
     {
         if (!$forceRefresh && $this->accessToken && $this->publicToken)
             return;
 
-        if (!$forceRefresh && file_exists($this->cacheFile)) {
-            $rawContent = @file_get_contents($this->cacheFile);
+        if (!$forceRefresh) {
+            $rawContent = $this->storage->getCache($this->getCacheKey());
 
             if ($rawContent) {
-                // Intentamos desencriptar la caché con la secretKey
                 $decrypted = $this->getCryptor()->decrypt($rawContent);
                 $cached = $decrypted ? json_decode($decrypted, true) : null;
 
@@ -331,10 +568,16 @@ class CrafyCAPTCHA
         $this->accessToken = $response['token'];
         $this->publicToken = $response['public_token'];
 
-        $expiresIn = (int) ($response['expires_in'] ?? 86400); // 24hs por defecto
+        $expiresIn = (int) ($response['expires_in'] ?? 86400);
         $this->saveCache($this->accessToken, $this->publicToken, time() + $expiresIn);
     }
 
+    /**
+     * Guarda los tokens de autenticación en caché encriptada.
+     * @param string $token Access Token de la API.
+     * @param string $publicToken Public Token para el frontend.
+     * @param int $expiresAt Timestamp UNIX de expiración.
+     */
     private function saveCache(string $token, string $publicToken, int $expiresAt): void
     {
         $data = json_encode([
@@ -343,23 +586,29 @@ class CrafyCAPTCHA
             'expires_at' => $expiresAt
         ]);
 
-        // Encriptamos los datos sensibles antes de escribirlos en el directorio temporal
         $encryptedData = $this->getCryptor()->encrypt($data);
-
-        if (@file_put_contents($this->cacheFile, $encryptedData, LOCK_EX) !== false) {
-            @chmod($this->cacheFile, 0600);
-        }
+        $this->storage->setCache($this->getCacheKey(), $encryptedData, $expiresAt);
     }
 
+    /**
+     * Limpia los tokens de memoria y elimina la caché persistida.
+     */
     private function clearCache(): void
     {
         $this->accessToken = null;
         $this->publicToken = null;
-        if (file_exists($this->cacheFile)) {
-            @unlink($this->cacheFile);
-        }
+        $this->storage->deleteCache($this->getCacheKey());
     }
 
+    /**
+     * Envía una petición HTTP POST a la API con soporte de Exponential Backoff.
+     * Respeta el header Retry-After si está presente.
+     * @param string $action Acción de la API.
+     * @param array $data Datos del body.
+     * @param bool $useAuth Si es true, incluye el header Authorization Bearer.
+     * @return array Datos de respuesta.
+     * @throws Exception En caso de error de red, HTTP o API.
+     */
     private function sendRequest(string $action, array $data, bool $useAuth): array
     {
         $url = $this->baseUrl . '/?action=' . urlencode($action);
@@ -378,48 +627,40 @@ class CrafyCAPTCHA
         $maxAttempts = $this->maxRetries + 1;
 
         while ($attempt < $maxAttempts) {
+            $attempt++;
+
             $ch = curl_init($url);
-            if (!$ch) {
-                throw new Exception("CrafyCAPTCHA: Fallo al inicializar cURL.");
-            }
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+            curl_setopt($ch, CURLOPT_TIMEOUT, $this->timeout);
+            curl_setopt($ch, CURLOPT_HEADER, true);
 
-            $responseHeaders = [];
-
-            curl_setopt_array($ch, [
-                CURLOPT_POST => true,
-                CURLOPT_POSTFIELDS => json_encode($data),
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER => $headers,
-                CURLOPT_TIMEOUT => $this->timeout,
-                CURLOPT_SSL_VERIFYPEER => true,
-                CURLOPT_HEADERFUNCTION => function ($curl, $header) use (&$responseHeaders) {
-                    $len = strlen($header);
-                    $parts = explode(':', $header, 2);
-                    if (count($parts) >= 2) {
-                        $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
-                    }
-                    return $len;
-                }
-            ]);
-
-            $resultRaw = curl_exec($ch);
+            $response = curl_exec($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
             $curlError = curl_error($ch);
             curl_close($ch);
 
-            $attempt++;
-
-            // Evaluar si debemos reintentar (Backoff)
-            $shouldRetry = false;
-            if (!$curlError && in_array($httpCode, $this->retryStatusCodes)) {
-                $shouldRetry = true;
+            if ($response === false) {
+                if ($attempt >= $maxAttempts) {
+                    throw new Exception("CrafyCAPTCHA Network Error: " . $curlError);
+                }
+                $delayUs = (int) (($this->baseDelayMs * 1000) * pow(2, $attempt - 1));
+                usleep($delayUs);
+                continue;
             }
 
+            $rawHeaders = substr($response, 0, $headerSize);
+            $body = substr($response, $headerSize);
+
+            $shouldRetry = in_array($httpCode, $this->retryStatusCodes);
+
             if ($shouldRetry && $attempt < $maxAttempts) {
-                // Respetar Retry-After si existe
                 $delayUs = 0;
-                if (isset($responseHeaders['retry-after'])) {
-                    $retryAfter = $responseHeaders['retry-after'];
+                if (preg_match('/Retry-After:\s*([^\r\n]+)/i', $rawHeaders, $matches)) {
+                    $retryAfter = trim($matches[1]);
                     if (is_numeric($retryAfter)) {
                         $delayUs = (int) $retryAfter * 1000000;
                     } else {
@@ -430,27 +671,20 @@ class CrafyCAPTCHA
                     }
                 }
 
-                // Fallback a Exponential Backoff
                 if ($delayUs <= 0) {
-                    $delayUs = ($this->baseDelayMs * 1000) * pow(2, $attempt - 1);
+                    $delayUs = (int) (($this->baseDelayMs * 1000) * pow(2, $attempt - 1));
                 }
 
                 usleep($delayUs);
                 continue;
             }
 
-            // Manejo de respuesta final tras reintentos agotados
-            if ($curlError) {
-                throw new Exception("CrafyCAPTCHA Network Error: $curlError");
-            }
-
             if ($httpCode === 401) {
-                throw new Exception("Unauthorized", 401); // Para que el método call() lo capture
+                throw new Exception("Unauthorized", 401);
             }
 
-            $response = json_decode((string) $resultRaw, true);
+            $jsonResp = json_decode($body, true);
 
-            // Evitar crash si es un error HTML (ej. Cloudflare 500)
             if (json_last_error() !== JSON_ERROR_NONE) {
                 if ($httpCode >= 400) {
                     throw new Exception("CrafyCAPTCHA HTTP Error ($httpCode)", $httpCode);
@@ -458,8 +692,8 @@ class CrafyCAPTCHA
                 throw new Exception("CrafyCAPTCHA API Error: Respuesta inválida. HTTP Code: $httpCode");
             }
 
-            if (isset($response['status']) && $response['status'] === 'error') {
-                $msg = $response['message'] ?? 'Error desconocido';
+            if (($jsonResp['status'] ?? '') === 'error') {
+                $msg = $jsonResp['message'] ?? 'Error desconocido';
                 throw new Exception($msg, $httpCode);
             }
 
@@ -467,7 +701,7 @@ class CrafyCAPTCHA
                 throw new Exception("CrafyCAPTCHA HTTP Error ($httpCode)", $httpCode);
             }
 
-            return $response['data'] ?? [];
+            return $jsonResp['data'] ?? [];
         }
 
         throw new Exception("CrafyCAPTCHA: Max retries exceeded.");
@@ -475,80 +709,53 @@ class CrafyCAPTCHA
 
     /**
      * Retorna una instancia de la clase anónima de encriptación.
-     * Esta clase anónima encapsula toda la lógica de BitBookLiteCryptor.
-     * * @return object Clase anónima con métodos encrypt() y decrypt()
+     * Soporta 3 versiones: v3 (XChaCha20-Poly1305), v2 (Sodium pwhash), v1 (AES-256-CBC + HMAC).
+     * @return object Clase anónima con métodos encrypt() y decrypt().
      */
-    private function getCryptor()
+    private function getCryptor(): object
     {
-        return new class ($this->secretKey) {
-
+        return clone new class ($this->secretKey) {
             private const ENCRYPTION_ALGORITHM = 'AES-256-CBC';
             private const HASHING_ALGORITHM = 'sha256';
 
-            // Constantes Sodium
-            private const SALT_LEN = 16;  // SODIUM_CRYPTO_PWHASH_SALTBYTES
-            private const KEY_LEN = 32;  // SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES
-            private const NONCE_LEN = 24;  // SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES
+            private string $secretKey;
+            private string $v1Key;
+            private string $v3Key;
 
-            private string $secret;
-            private $v3Key;
-            private $v1Key;
-
-            public function __construct(string $secret)
+            public function __construct(string $secretKey)
             {
-                if ($secret === '')
-                    throw new \InvalidArgumentException('Secret no puede ser vacío.');
-                $this->secret = $secret;
+                $this->secretKey = $secretKey;
+                $this->v1Key = hash('sha256', $this->secretKey, true);
 
                 if (function_exists('sodium_crypto_generichash')) {
-                    $this->v3Key = sodium_crypto_generichash($secret, '', self::KEY_LEN);
+                    $this->v3Key = sodium_crypto_generichash($this->secretKey, '', 32);
                 }
-
-                $this->v1Key = hash(self::HASHING_ALGORITHM, $secret, true);
             }
 
             public function encrypt(string $plaintext, int $version = 3): string
             {
-                if ($version == 3 && function_exists('sodium_crypto_generichash')) {
-                    $nonce = random_bytes(self::NONCE_LEN);
-
-                    $ciphertext = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt(
-                        $plaintext,
-                        '',
-                        $nonce,
-                        $this->v3Key
-                    );
-
+                if ($version === 3 && function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_encrypt')) {
+                    $nonce = random_bytes(SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
+                    $ciphertext = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($plaintext, '', $nonce, $this->v3Key);
                     return ';v3_;' . base64_encode($nonce . $ciphertext);
-
-                } elseif ($version == 2 && function_exists('sodium_crypto_pwhash')) {
-                    $salt = random_bytes(self::SALT_LEN);
-
-                    // Derivación de clave
+                } elseif ($version === 2 && function_exists('sodium_crypto_pwhash')) {
+                    $salt = random_bytes(SODIUM_CRYPTO_PWHASH_SALTBYTES);
                     $key = sodium_crypto_pwhash(
-                        self::KEY_LEN,
-                        $this->secret,
+                        SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES,
+                        $this->secretKey,
                         $salt,
                         SODIUM_CRYPTO_PWHASH_OPSLIMIT_INTERACTIVE,
-                        SODIUM_CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE
+                        SODIUM_CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE,
+                        SODIUM_CRYPTO_PWHASH_ALG_DEFAULT
                     );
 
-                    $nonce = random_bytes(self::NONCE_LEN);
-
-                    $ciphertext = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt(
-                        $plaintext,
-                        '',
-                        $nonce,
-                        $key
-                    );
+                    $nonce = random_bytes(SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
+                    $ciphertext = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($plaintext, '', $nonce, $key);
 
                     sodium_memzero($key);
-
-                    $out = $salt . $nonce . $ciphertext;
-                    return ';v2_;' . base64_encode($out);
+                    return ';v2_;' . base64_encode($salt . $nonce . $ciphertext);
                 } else {
                     $iv = random_bytes(16);
-
                     $cipherText = openssl_encrypt(
                         $plaintext,
                         self::ENCRYPTION_ALGORITHM,
@@ -556,64 +763,48 @@ class CrafyCAPTCHA
                         OPENSSL_RAW_DATA,
                         $iv
                     );
-                    $hash = hash_hmac(self::HASHING_ALGORITHM, $cipherText, $this->v1Key, true);
 
+                    $hash = hash_hmac(self::HASHING_ALGORITHM, $cipherText, $this->v1Key, true);
                     return bin2hex($iv . $hash . $cipherText);
                 }
             }
 
             public function decrypt(string $input): ?string
             {
-                $first_chars = substr($input, 0, 5);
+                $firstChars = substr($input, 0, 5);
 
-                if ($first_chars === ';v3_;' && function_exists('sodium_crypto_generichash')) {
-                    $input = substr($input, 5);
-                    $decoded = base64_decode($input, true);
-
-                    if ($decoded === false || strlen($decoded) < self::NONCE_LEN) {
+                if ($firstChars === ';v3_;' && function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_decrypt')) {
+                    $decoded = base64_decode(substr($input, 5));
+                    if (strlen($decoded) < SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES)
                         return null;
-                    }
 
-                    $nonce = substr($decoded, 0, self::NONCE_LEN);
-                    $ciphertext = substr($decoded, self::NONCE_LEN);
+                    $nonce = substr($decoded, 0, SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
+                    $ciphertext = substr($decoded, SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
 
-                    $plaintext = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt(
-                        $ciphertext,
-                        '',
-                        $nonce,
-                        $this->v3Key
-                    );
-
+                    $plaintext = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt($ciphertext, '', $nonce, $this->v3Key);
                     return $plaintext === false ? null : $plaintext;
+                } elseif ($firstChars === ';v2_;' && function_exists('sodium_crypto_pwhash')) {
+                    $decoded = base64_decode(substr($input, 5));
+                    $saltLen = SODIUM_CRYPTO_PWHASH_SALTBYTES;
+                    $nonceLen = SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES;
 
-                } elseif ($first_chars === ';v2_;' && function_exists('sodium_crypto_pwhash')) {
-                    $input = substr($input, 5);
-                    $decoded = base64_decode($input, true);
-
-                    if ($decoded === false)
-                        return null;
-                    if (strlen($decoded) < (self::SALT_LEN + self::NONCE_LEN + 1))
+                    if (strlen($decoded) < ($saltLen + $nonceLen + 1))
                         return null;
 
-                    $salt = substr($decoded, 0, self::SALT_LEN);
-                    $nonce = substr($decoded, self::SALT_LEN, self::NONCE_LEN);
-                    $ciphertext = substr($decoded, self::SALT_LEN + self::NONCE_LEN);
+                    $salt = substr($decoded, 0, $saltLen);
+                    $nonce = substr($decoded, $saltLen, $nonceLen);
+                    $ciphertext = substr($decoded, $saltLen + $nonceLen);
 
                     $key = sodium_crypto_pwhash(
-                        self::KEY_LEN,
-                        $this->secret,
+                        SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES,
+                        $this->secretKey,
                         $salt,
                         SODIUM_CRYPTO_PWHASH_OPSLIMIT_INTERACTIVE,
-                        SODIUM_CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE
+                        SODIUM_CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE,
+                        SODIUM_CRYPTO_PWHASH_ALG_DEFAULT
                     );
 
-                    $plaintext = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt(
-                        $ciphertext,
-                        '',
-                        $nonce,
-                        $key
-                    );
-
+                    $plaintext = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt($ciphertext, '', $nonce, $key);
                     sodium_memzero($key);
                     return $plaintext === false ? null : $plaintext;
                 } else {
@@ -621,9 +812,8 @@ class CrafyCAPTCHA
                         return null;
 
                     $binaryInput = hex2bin($input);
-                    if (strlen($binaryInput) < 48) {
+                    if (strlen($binaryInput) < 48)
                         return null;
-                    }
 
                     $iv = substr($binaryInput, 0, 16);
                     $hash = substr($binaryInput, 16, 32);
@@ -631,9 +821,8 @@ class CrafyCAPTCHA
 
                     $calculatedHash = hash_hmac(self::HASHING_ALGORITHM, $cipherText, $this->v1Key, true);
 
-                    if (!hash_equals($hash, $calculatedHash)) {
+                    if (!hash_equals($hash, $calculatedHash))
                         return null;
-                    }
 
                     $plaintext = openssl_decrypt(
                         $cipherText,
